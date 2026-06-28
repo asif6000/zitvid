@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id           String         @id @default(cuid())
+  email        String         @unique
+  passwordHash String?
+  name         String?
+  role         String         @default("USER")
+  createdAt    DateTime       @default(now())
+  subscriptions Subscription[]
+  payments     Payment[]
+  downloads    Download[]
+}
+
+model Plan {
+  id            String         @id @default(cuid())
+  name          String
+  price         Float
+  currency      String
+  interval      String
+  features      String         @default("[]")
+  createdAt     DateTime       @default(now())
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id               String         @id @default(cuid())
+  userId           String
+  planId           String
+  status           String
+  currentPeriodEnd DateTime
+  createdAt        DateTime       @default(now())
+  user             User           @relation(fields: [userId], references: [id])
+  plan             Plan           @relation(fields: [planId], references: [id])
+}
+
+model Payment {
+  id        String   @id @default(cuid())
+  userId    String
+  amount    Float
+  currency  String
+  provider  String
+  status    String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model Download {
+  id        String    @id @default(cuid())
+  url       String
+  platform  String
+  title     String    @default("Processing...")
+  quality   String    @default("auto")
+  format    String    @default("mp4")
+  status    String    @default("PENDING")
+  userId    String?
+  createdAt DateTime  @default(now())
+  user      User?     @relation(fields: [userId], references: [id])
+}
+
+model PaymentGateway {
+  provider  String   @id
+  label     String
+  config    String   @default("{}")
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model AdNetwork {
+  provider  String   @id
+  label     String
+  config    String   @default("{}")
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model SiteSetting {
+  key   String @id
+  value String
+}

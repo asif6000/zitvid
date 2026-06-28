@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" id="favicon" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Zinvid - Free Video Downloader</title>
+    <meta name="description" content="Download videos from YouTube, Instagram, TikTok, Facebook, and 50+ platforms. Fast, free, and high-quality." />
+    <script>
+      (async function() {
+        try {
+          const res = await fetch("/api/settings");
+          const data = await res.json();
+          if (data.settings?.faviconUrl) {
+            document.getElementById("favicon").href = data.settings.faviconUrl;
+          }
+          if (data.settings?.siteName) {
+            document.title = data.settings.siteName + " - Free Video Downloader";
+          }
+        } catch(e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
