@@ -1,6 +1,16 @@
+# Force correct MIME types (prevents "text/html" serving for JS/CSS)
+AddType application/javascript .js
+AddType text/css .css
+AddType image/svg+xml .svg
+AddType application/wasm .wasm
+
 # SPA Routing - Frontend
 RewriteEngine On
 RewriteBase /
+
+# Proxy API routes to Node.js backend
+RewriteRule ^api/(.*) http://localhost:3000/api/$1 [P,L]
+
 RewriteRule ^index\.html$ - [L]
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d

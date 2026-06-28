@@ -1,36 +1,23 @@
 import { Router } from "express";
+import { spawn } from "child_process";
 import { prisma } from "../config/prisma.js";
 import { optionalAuth } from "../middleware/auth.js";
 import path from "path";
 import fs from "fs";
 import os from "os";
-import { createRequire } from "module";
-import ytdlp from "yt-dlp-exec";
 
-const require = createRequire(import.meta.url);
-const ffmpegPath: string = path.dirname(require("@ffmpeg-installer/ffmpeg").path);
+const ytTmpDir = path.join(os.homedir(), "tmp");
+process.env["TMPDIR"] = process.env["TMPDIR"] || ytTmpDir;
+try { fs.mkdirSync(ytTmpDir, { recursive: true }); } catch {}
 
 const router = Router();
-
 const infoCache = new Map<string, any>();
-router.get("/info/:id", async (req, res) => {
-  const id = req.params.id as string;
-  const cached = infoCache.get(id);
-  if (cached) {
-    res.json(cached);
-    return;
-  }
-  const download = await prisma.download.findUnique({ where: { id } });
-  if (!download) {
-    res.status(404).json({ error: "Download not found" });
-    return;
-  }
-  if (download.status === "FAILED") {
-    res.json({ error: "Failed to fetch video info" });
-    return;
-  }
-  res.status(202).json({ status: "PROCESSING", message: "Fetching video information..." });
-});
+
+const YT_CLIENTS = ["web_safari", "web_creator", "mweb", "android", "web"];
+
+function getCookiesPath(): string | null {
+  return process.env["YOUTUBE_COOKIES_FILE"] || process.env["YT_DLP_COOKIES"] || null;
+}
 
 function detectPlatform(url: string): string {
   if (url.includes("youtube.com") || url.includes("youtu.be")) return "youtube";
@@ -42,17 +29,13 @@ function detectPlatform(url: string): string {
   return "unknown";
 }
 
-function getFormatArg(format: string, quality: string): string[] {
-  if (format === "mp3") {
-    return ["-x", "--audio-format", "mp3", "--audio-quality", "0"];
-  }
+function getFormatArgs(format: string, quality: string): string[] {
+  if (format === "mp3") return ["-x", "--audio-format", "mp3", "--audio-quality", "0"];
   if (/^\d+p$/.test(quality)) {
     const h = quality.replace("p", "");
     return ["-f", `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`];
   }
-  if (quality === "4K") {
-    return ["-f", "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"];
-  }
+  if (quality === "4K") return ["-f", "bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"];
   return ["-f", "bestvideo+bestaudio/best"];
 }
 
@@ -61,10 +44,8 @@ function parseFormats(info: any): { quality: string; format: string; size: strin
   if (!info?.formats) return result;
 
   const groups: Record<string, any> = {};
-
   for (const f of info.formats) {
     if (!f.ext) continue;
-
     let label: string;
     let type: "video" | "audio" | "combined";
 
@@ -108,10 +89,8 @@ function parseFormats(info: any): { quality: string; format: string; size: strin
     } else continue;
 
     if (type === "video" && !["mp4", "webm"].includes(f.ext)) continue;
-
     const groupKey = type === "audio" ? "MP3" : `${label}_mp4`;
     const size = f.filesize || f.filesize_approx || 0;
-
     const existing = groups[groupKey];
     if (!existing || size > (existing.filesize || existing.filesize_approx || 0)) {
       groups[groupKey] = { ...f, qualityLabel: label, type };
@@ -128,12 +107,7 @@ function parseFormats(info: any): { quality: string; format: string; size: strin
     else sizeStr = "Unknown";
 
     const displayFormat = g.qualityLabel === "MP3" ? "mp3" : "mp4";
-    result.push({
-      quality: g.qualityLabel,
-      format: displayFormat,
-      size: sizeStr,
-      formatId: g.format_id,
-    });
+    result.push({ quality: g.qualityLabel, format: displayFormat, size: sizeStr, formatId: g.format_id });
   }
 
   const resolutionOrder = ["4K", "2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p", "MP3"];
@@ -151,54 +125,100 @@ function parseFormats(info: any): { quality: string; format: string; size: strin
   });
 }
 
+function runYtDlp(args: string[], timeout = 120000): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("yt-dlp", args, { timeout });
+    let stdout = "";
+    let stderr = "";
+    proc.stdout.on("data", (d) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`yt-dlp not found: ${err.message}`)));
+    proc.on("close", (code) => {
+      if (code === 0) resolve({ stdout, stderr });
+      else reject(new Error(stderr.slice(0, 1000) || `yt-dlp exited with code ${code}`));
+    });
+  });
+}
+
+async function ytDlpGetInfo(url: string): Promise<any> {
+  const isYouTube = url.includes("youtube.com") || url.includes("youtu.be");
+  const cookiesPath = getCookiesPath();
+
+  if (!isYouTube) {
+    const args = ["--dump-single-json", "--no-playlist", "--no-warnings"];
+    if (cookiesPath && fs.existsSync(cookiesPath)) args.push("--cookies", cookiesPath);
+    args.push(url);
+    const { stdout } = await runYtDlp(args);
+    return JSON.parse(stdout);
+  }
+
+  let lastErr: string | null = null;
+  for (const client of YT_CLIENTS) {
+    const args = [
+      "--dump-single-json", "--no-playlist", "--no-warnings",
+      "--extractor-args", `youtube:player_client=${client};player_skip=webpage,configs`,
+    ];
+    if (cookiesPath && fs.existsSync(cookiesPath)) args.push("--cookies", cookiesPath);
+    args.push(url);
+    try {
+      const { stdout } = await runYtDlp(args);
+      return JSON.parse(stdout);
+    } catch (err: any) {
+      const msg = err.message || "";
+      if (msg.includes("Sign in") || msg.includes("bot") || msg.includes("429") || msg.includes("confirm")) {
+        console.warn(`[yt-dlp] Client '${client}' blocked, trying next...`);
+        lastErr = cookiesPath
+          ? "YouTube blocked all clients. Refresh cookies or update yt-dlp."
+          : "YouTube bot detection. Export cookies and set YOUTUBE_COOKIES_FILE.";
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(lastErr || "yt-dlp info fetch failed");
+}
+
+router.get("/info/:id", async (req, res) => {
+  const id = req.params.id as string;
+  const cached = infoCache.get(id);
+  if (cached) { res.json(cached); return; }
+  const download = await prisma.download.findUnique({ where: { id } });
+  if (!download) { res.status(404).json({ error: "Download not found" }); return; }
+  if (download.status === "FAILED") { res.json({ error: "Failed to fetch video info" }); return; }
+  res.status(202).json({ status: "PROCESSING", message: "Fetching video information..." });
+});
+
 router.post("/", optionalAuth, async (req, res) => {
   try {
     const { url } = req.body;
-    if (!url) {
-      res.status(400).json({ error: "URL is required" });
-      return;
-    }
+    if (!url) { res.status(400).json({ error: "URL is required" }); return; }
 
     const platform = detectPlatform(url);
-
     const download = await prisma.download.create({
       data: {
-        url,
-        platform,
+        url, platform,
         title: "Processing...",
-        quality: "auto",
-        format: "mp4",
+        quality: "auto", format: "mp4",
         status: "PENDING",
         userId: req.user?.userId || null,
       },
     });
 
     res.json({
-      success: true,
-      downloadId: download.id,
-      platform,
-      title: "Processing...",
-      formats: [],
-      thumbnail: null,
-      duration: null,
-      status: "PROCESSING",
-      message: "Fetching video information...",
+      success: true, downloadId: download.id, platform,
+      title: "Processing...", formats: [],
+      thumbnail: null, duration: null,
+      status: "PROCESSING", message: "Fetching video information...",
     });
 
     ytDlpGetInfo(url).then((info) => {
       const title = info?.title || "Video";
       const formats = parseFormats(info);
-      prisma.download.update({
-        where: { id: download.id },
-        data: { title, status: "COMPLETED" },
-      }).catch(() => {});
+      prisma.download.update({ where: { id: download.id }, data: { title, status: "COMPLETED" } }).catch(() => {});
       infoCache.set(download.id, { title, formats, thumbnail: info?.thumbnail || null, duration: info?.duration || null, platform });
     }).catch((err) => {
       console.error("Info fetch error:", err);
-      prisma.download.update({
-        where: { id: download.id },
-        data: { status: "FAILED" },
-      }).catch(() => {});
+      prisma.download.update({ where: { id: download.id }, data: { status: "FAILED" } }).catch(() => {});
       infoCache.set(download.id, { error: err?.message || "Failed to fetch video info" });
     });
   } catch (err: any) {
@@ -207,27 +227,12 @@ router.post("/", optionalAuth, async (req, res) => {
   }
 });
 
-function ytDlpGetInfo(url: string): Promise<any> {
-  return ytdlp(url, {
-    dumpJson: true,
-    simulate: true,
-    noPlaylist: true,
-    noWarnings: true,
-    extractorArgs: "youtube:player_client=android",
-    ffmpegLocation: ffmpegPath,
-  } as any).catch((err: any) => {
-    throw new Error(err?.stderr?.slice?.(0, 500) || err?.message || "yt-dlp info fetch failed");
-  });
-}
-
 router.get("/trending", optionalAuth, async (req, res) => {
   try {
     const userId = (req as any).user?.userId || null;
-
     const downloads = await prisma.download.findMany({
       where: { status: "COMPLETED" },
-      orderBy: { createdAt: "desc" },
-      take: 12,
+      orderBy: { createdAt: "desc" }, take: 12,
     });
 
     const platformColors: Record<string, string> = {
@@ -264,7 +269,6 @@ router.get("/trending", optionalAuth, async (req, res) => {
     };
 
     const items: any[] = [];
-
     for (const d of downloads) {
       const cached = infoCache.get(d.id);
       const duration = formatDur(cached?.duration);
@@ -272,14 +276,8 @@ router.get("/trending", optionalAuth, async (req, res) => {
       const platform = d.platform || "youtube";
       const title = d.title !== "Processing..." ? d.title : "Video Download";
       const isUserDownload = userId && d.userId === userId;
-
       items.push({
-        id: d.id,
-        title,
-        platform,
-        url: d.url,
-        duration,
-        thumbnail,
+        id: d.id, title, platform, url: d.url, duration, thumbnail,
         gradient: platformColors[platform] || fallbackGradients[items.length % fallbackGradients.length],
         downloads: Math.floor(Math.random() * 80000) + 5000,
         isUserDownload: !!isUserDownload,
@@ -299,16 +297,14 @@ router.get("/trending", optionalAuth, async (req, res) => {
       const i = items.length;
       const seed = `trending-fallback-${i}`;
       items.push({
-        id: seed,
-        title: fallbackTitles[i % fallbackTitles.length],
+        id: seed, title: fallbackTitles[i % fallbackTitles.length],
         platform: fallbackPlatforms[i % fallbackPlatforms.length],
         url: `https://www.${fallbackPlatforms[i % fallbackPlatforms.length]}.com/watch?v=example${i}`,
         duration: fallbackDurations[i % fallbackDurations.length],
         gradient: fallbackGradients[i % fallbackGradients.length],
         thumbnail: `https://picsum.photos/seed/${seed}/320/180`,
         downloads: Math.floor(Math.random() * 80000) + 5000,
-        isUserDownload: false,
-        createdAt: new Date(0).toISOString(),
+        isUserDownload: false, createdAt: new Date(0).toISOString(),
       });
     }
 
@@ -322,35 +318,23 @@ router.get("/trending", optionalAuth, async (req, res) => {
 router.get("/history", async (req, res) => {
   try {
     const header = req.headers.authorization;
-    if (!header?.startsWith("Bearer ")) {
-      res.status(401).json({ error: "Unauthorized" });
-      return;
-    }
-
+    if (!header?.startsWith("Bearer ")) { res.status(401).json({ error: "Unauthorized" }); return; }
     const jwt = await import("jsonwebtoken");
     const JWT_SECRET = process.env["JWT_SECRET"] || "supersecretjwtkey123";
     const token = header.slice(7);
     const payload = jwt.default.verify(token, JWT_SECRET) as { userId: string };
-
     const downloads = await prisma.download.findMany({
       where: { userId: payload.userId },
-      orderBy: { createdAt: "desc" },
-      take: 50,
+      orderBy: { createdAt: "desc" }, take: 50,
     });
-
     res.json({ downloads });
-  } catch {
-    res.status(401).json({ error: "Invalid token" });
-  }
+  } catch { res.status(401).json({ error: "Invalid token" }); }
 });
 
 router.get("/:id", optionalAuth, async (req, res) => {
   try {
     const download = await prisma.download.findUnique({ where: { id: req.params.id as string } });
-    if (!download) {
-      res.status(404).json({ error: "Download not found" });
-      return;
-    }
+    if (!download) { res.status(404).json({ error: "Download not found" }); return; }
 
     const quality = (req.query.quality as string) || download.quality;
     const format = (req.query.format as string) || download.format;
@@ -359,85 +343,85 @@ router.get("/:id", optionalAuth, async (req, res) => {
     const safeName = (download.title || "video").replace(/[^a-zA-Z0-9_-]/g, "_");
     const downloadName = `${safeName}.${ext}`;
 
-    await prisma.download.update({
-      where: { id: download.id },
-      data: { status: "COMPLETED", quality, format },
-    }).catch(() => {});
+    await prisma.download.update({ where: { id: download.id }, data: { status: "COMPLETED", quality, format } }).catch(() => {});
 
     const tmpFile = path.join(os.tmpdir(), `savetube_${download.id}_${Date.now()}.${ext}`);
-
-    const ytFlags: Record<string, any> = {
-      output: tmpFile.replace(/\.(mp4|mp3)$/, ".%(ext)s"),
-      noPlaylist: true,
-      noProgress: true,
-      noWarnings: true,
-      noWriteSubs: true,
-      embedMetadata: true,
-      ffmpegLocation: ffmpegPath,
-    };
-
-    if (format === "mp3") {
-      ytFlags.extractAudio = true;
-      ytFlags.audioFormat = "mp3";
-      ytFlags.audioQuality = 0;
-    } else if (formatId) {
-      ytFlags.format = `${formatId}+bestaudio/best`;
-    } else {
-      const fa = getFormatArg(format, quality);
-      ytFlags.format = fa[1];
-    }
-
     const actualExt = format === "mp3" ? "mp3" : ext;
     const actualFile = tmpFile.replace(/\.(mp4|mp3)$/, `.${actualExt}`);
     const webmFile = tmpFile.replace(/\.(mp4|mp3)$/, ".webm");
     const mkvFile = tmpFile.replace(/\.(mp4|mp3)$/, ".mkv");
-    let finalFile: string | null = null;
-    try {
-      await ytdlp(download.url, ytFlags, { timeout: 600000 });
 
-      if (fs.existsSync(actualFile)) {
-        finalFile = actualFile;
-      } else if (fs.existsSync(webmFile)) {
-        finalFile = webmFile;
-      } else if (fs.existsSync(mkvFile)) {
-        finalFile = mkvFile;
-      } else if (fs.existsSync(tmpFile)) {
-        finalFile = tmpFile;
+    const cookiesPath = getCookiesPath();
+    const isYouTube = download.url.includes("youtube.com") || download.url.includes("youtu.be");
+
+    let lastErr: Error | null = null;
+    const clientsToTry = isYouTube ? [...YT_CLIENTS, ""] : [""];
+
+    for (const client of clientsToTry) {
+      const baseArgs = [
+        "--output", tmpFile.replace(/\.(mp4|mp3)$/, ".%(ext)s"),
+        "--no-playlist", "--no-progress", "--no-warnings",
+        "--no-write-subs", "--embed-metadata",
+      ];
+      if (cookiesPath && fs.existsSync(cookiesPath)) baseArgs.push("--cookies", cookiesPath);
+      if (client) {
+        baseArgs.push("--extractor-args", `youtube:player_client=${client};player_skip=webpage,configs`);
+      }
+      if (format === "mp3") {
+        baseArgs.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
+      } else if (formatId) {
+        baseArgs.push("-f", `${formatId}+bestaudio/best`);
       } else {
-        res.status(500).json({ error: "Download failed", details: "No output file created" });
-        return;
+        baseArgs.push(...getFormatArgs(format, quality));
       }
+      baseArgs.push(download.url);
 
-      const contentType = format === "mp3" ? "audio/mpeg" : "video/mp4";
-      res.setHeader("Content-Type", contentType);
-      res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
-
-      const stream = fs.createReadStream(finalFile);
-      stream.pipe(res);
-
-      stream.on("error", (err) => {
-        console.error("Stream error:", err);
-        if (!res.headersSent) res.status(500).json({ error: "Download failed" });
-      });
-
-      const cleanup = () => {
-        [tmpFile, actualFile, webmFile, mkvFile, finalFile].forEach((f) => {
-          if (f) try { fs.unlinkSync(f); } catch {}
-        });
-      };
-      res.on("finish", cleanup);
-      res.on("close", cleanup);
-    } catch (err: any) {
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Download failed", details: err?.stderr?.slice?.(0, 500) || err?.message });
+      try {
+        await runYtDlp(baseArgs, 600000);
+        lastErr = null;
+        break;
+      } catch (err: any) {
+        lastErr = err;
+        const msg = err.message || "";
+        if (msg.includes("Sign in") || msg.includes("bot") || msg.includes("429") || msg.includes("confirm")) {
+          console.warn(`[yt-dlp] Download client '${client || "default"}' blocked, trying next...`);
+          continue;
+        }
+        break;
       }
-      [tmpFile, actualFile, webmFile, mkvFile, finalFile].forEach((f) => {
-        if (f) try { fs.unlinkSync(f); } catch {}
-      });
     }
-  } catch (err) {
+
+    if (lastErr) {
+      if (!res.headersSent) res.status(500).json({ error: "Download failed", details: lastErr.message });
+      [tmpFile, actualFile, webmFile, mkvFile].forEach((f) => { if (f) try { fs.unlinkSync(f); } catch {} });
+      return;
+    }
+
+    let finalFile: string | null = null;
+    if (fs.existsSync(actualFile)) finalFile = actualFile;
+    else if (fs.existsSync(webmFile)) finalFile = webmFile;
+    else if (fs.existsSync(mkvFile)) finalFile = mkvFile;
+    else if (fs.existsSync(tmpFile)) finalFile = tmpFile;
+    else {
+      res.status(500).json({ error: "Download failed", details: "No output file created" });
+      return;
+    }
+
+    const contentType = format === "mp3" ? "audio/mpeg" : "video/mp4";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
+
+    const stream = fs.createReadStream(finalFile);
+    stream.pipe(res);
+    stream.on("error", () => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
+
+    const cleanup = () => { [tmpFile, actualFile, webmFile, mkvFile, finalFile].forEach((f) => { if (f) try { fs.unlinkSync(f); } catch {} }); };
+    res.on("finish", cleanup);
+    res.on("close", cleanup);
+  } catch (err: any) {
     console.error("Download error:", err);
     if (!res.headersSent) res.status(500).json({ error: "Failed to process download" });
   }
 });
+
 export default router;
