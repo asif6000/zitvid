@@ -16,7 +16,18 @@ const infoCache = new Map<string, any>();
 const YT_CLIENTS = ["web_safari", "web_creator", "mweb", "android", "web"];
 
 function getCookiesPath(): string | null {
-  return process.env["YOUTUBE_COOKIES_FILE"] || process.env["YT_DLP_COOKIES"] || null;
+  const envPath = process.env["YOUTUBE_COOKIES_FILE"] || process.env["YT_DLP_COOKIES"] || "";
+  if (envPath && fs.existsSync(envPath)) return envPath;
+  const searchPaths = [
+    path.join(os.homedir(), "cookies.txt"),
+    path.join(process.cwd(), "cookies.txt"),
+    path.join(process.cwd(), "..", "cookies.txt"),
+    path.join(os.tmpdir(), "cookies.txt"),
+  ];
+  for (const p of searchPaths) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
 }
 
 function detectPlatform(url: string): string {
